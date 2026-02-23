@@ -1,0 +1,169 @@
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$PomPath,
+
+    [Parameter(Mandatory=$true)]
+    [string]$JsonPath
+)
+
+if (!(Test-Path $PomPath)) {
+    Write-Error "pom.xml not found at $PomPath"
+    exit 1
+}
+
+if (!(Test-Path $JsonPath)) {
+    Write-Error "JSON file not found at $JsonPath"
+    exit 1
+}
+
+# ----------------------------
+# Parse LLM JSON
+# ----------------------------
+$jsonRaw = Get-Content $JsonPath -Raw
+$analysis = $jsonRaw | ConvertFrom-Json
+
+if (-not $analysis.activeRecipes) {
+    Write-Error "JSON must contain activeRecipes array."
+    exit 1
+}
+
+$pluginVersion = $analysis.rewritePluginVersion
+if (-not $pluginVersion) {
+    $pluginVersion = "5.38.0"   # default fallback
+}
+
+$recipes = $analysis.activeRecipes
+
+# ----------------------------
+# Load XML safely (Namespace-aware)
+# ----------------------------
+[xml]$xml = Get-Content $PomPath
+
+$nsUri = $xml.project.NamespaceURI
+$nsManager = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
+$nsManager.AddNamespace("ns", $nsUri)
+
+$project = $xml.SelectSingleNode("/ns:project", $nsManager)
+
+if (-not $project) {
+    Write-Error "Invalid pom.xml structure."
+    exit 1
+}
+
+function Create-Element($name) {
+    return $xml.CreateElement($name, $nsUri)
+}
+
+# ----------------------------
+# Ensure <build>
+# ----------------------------
+$build = $project.SelectSingleNode("ns:build", $nsManager)
+if (-not $build) {
+    $build = Create-Element "build"
+    $project.AppendChild($build) | Out-Null
+}
+
+# ----------------------------
+# Ensure <plugins>
+# ----------------------------
+$plugins = $build.SelectSingleNode("ns:plugins", $nsManager)
+if (-not $plugins) {
+    $plugins = Create-Element "plugins"
+    $build.AppendChild($plugins) | Out-Null
+}
+
+# ----------------------------
+# Find or Create Rewrite Plugin
+# ----------------------------
+$rewritePlugin = $null
+$pluginNodes = $plugins.SelectNodes("ns:plugin", $nsManager)
+
+foreach ($plugin in $pluginNodes) {
+    $groupId = $plugin.SelectSingleNode("ns:groupId", $nsManager)
+    $artifactId = $plugin.SelectSingleNode("ns:artifactId", $nsManager)
+
+    if ($groupId.InnerText -eq "org.openrewrite.maven" -and
+        $artifactId.InnerText -eq "rewrite-maven-plugin") {
+        $rewritePlugin = $plugin
+        break
+    }
+}
+
+if (-not $rewritePlugin) {
+    Write-Host "Adding rewrite-maven-plugin..."
+
+    $rewritePlugin = Create-Element "plugin"
+
+    $groupId = Create-Element "groupId"
+    $groupId.InnerText = "org.openrewrite.maven"
+
+    $artifactId = Create-Element "artifactId"
+    $artifactId.InnerText = "rewrite-maven-plugin"
+
+    $version = Create-Element "version"
+    $version.InnerText = $pluginVersion
+
+    $rewritePlugin.AppendChild($groupId) | Out-Null
+    $rewritePlugin.AppendChild($artifactId) | Out-Null
+    $rewritePlugin.AppendChild($version) | Out-Null
+
+    $plugins.AppendChild($rewritePlugin) | Out-Null
+}
+
+# ----------------------------
+# Ensure <configuration>
+# ----------------------------
+$configuration = $rewritePlugin.SelectSingleNode("ns:configuration", $nsManager)
+if (-not $configuration) {
+    $configuration = Create-Element "configuration"
+    $rewritePlugin.AppendChild($configuration) | Out-Null
+}
+
+# ----------------------------
+# Ensure <activeRecipes>
+# ----------------------------
+$activeRecipes = $configuration.SelectSingleNode("ns:activeRecipes", $nsManager)
+if (-not $activeRecipes) {
+    $activeRecipes = Create-Element "activeRecipes"
+    $configuration.AppendChild($activeRecipes) | Out-Null
+}
+
+# ----------------------------
+# Inject Recipes (No Duplicates)
+# ----------------------------
+foreach ($recipe in $recipes) {
+
+    $existing = $false
+    $recipeNodes = $activeRecipes.SelectNodes("ns:recipe", $nsManager)
+
+    foreach ($node in $recipeNodes) {
+        if ($node.InnerText -eq $recipe) {
+            $existing = $true
+            break
+        }
+    }
+
+    if (-not $existing) {
+        Write-Host "Injecting recipe: $recipe"
+
+        $recipeElement = Create-Element "recipe"
+        $recipeElement.InnerText = $recipe
+        $activeRecipes.AppendChild($recipeElement) | Out-Null
+    }
+    else {
+        Write-Host "Recipe already exists: $recipe"
+    }
+}
+
+# ----------------------------
+# Save XML with indentation
+# ----------------------------
+$settings = New-Object System.Xml.XmlWriterSettings
+$settings.Indent = $true
+$settings.OmitXmlDeclaration = $false
+
+$writer = [System.Xml.XmlWriter]::Create($PomPath, $settings)
+$xml.Save($writer)
+$writer.Close()
+
+Write-Host "pom.xml updated successfully."
